@@ -1,0 +1,23 @@
+{
+    "functions": [
+        {
+            "source": "functions",
+            "codebase": "default",
+            "ignore": [
+                "venv",
+                ".git",
+                "__pycache__"
+            ],
+            "runtime": "python311"
+        }
+    ],
+    "hosting": {
+        "public": "public",
+        "rewrites": [
+            {
+                "source": "**",
+                "function": "api"
+            }
+        ]
+    }
+}

@@ -1,0 +1,181 @@
+#!./venv/bin/python
+import os
+import glob
+import base64
+import requests
+from flask import Flask, render_template, request, jsonify
+from firebase_functions import https_fn
+from werkzeug.wrappers import Response
+from pypdf import PdfReader
+
+# Configuration
+API_KEY = "AQ.Ab8RN6LRdzDSFrtZ1BY3_3WMkV39SBGqiFo3mo2eRbJD4Ib9Tg"
+PROJECT_ID = "manualai-481406"
+LOCATION = "us-central1" 
+MANUALS_DIR = "manuals"
+
+# Vertex AI REST Endpoint
+ENDPOINT_URL = f"https://{LOCATION}-aiplatform.googleapis.com/v1beta1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/gemini-2.5-pro:generateContent"
+
+app = Flask(__name__)
+
+# Global cache for manuals text
+MANUALS_CONTEXT = ""
+
+def extract_text_from_pdf(pdf_path):
+    try:
+        reader = PdfReader(pdf_path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        print(f"Error reading {pdf_path}: {e}")
+        return ""
+
+def load_manuals():
+    global MANUALS_CONTEXT
+    print("Pre-loading manuals...")
+    manual_files = glob.glob(os.path.join(MANUALS_DIR, "*.pdf"))
+    context = ""
+    for manual_path in manual_files:
+        print(f"Loading {manual_path}...")
+        text = extract_text_from_pdf(manual_path)
+        if text:
+            context += f"\n\n--- Content from {os.path.basename(manual_path)} ---\n{text}"
+    MANUALS_CONTEXT = context
+    print(f"Loaded {len(MANUALS_CONTEXT)} chars of context.")
+
+# Global chat history (for demo purposes, single session)
+CHAT_HISTORY = []
+
+def get_manuals_instruction():
+    # Construct the system instruction / context from manuals
+    return f"""
+    You are a helpful assistant being used to solve technical errors.
+    
+    Context from Manuals:
+    {MANUALS_CONTEXT[:1000000]}
+    """
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/analyze', methods=['POST'])
+def analyze():
+    global CHAT_HISTORY
+    
+    # Check inputs (Image is now optional)
+    file = request.files.get('image')
+    user_message = request.form.get('message', '')
+    
+    if not file and not user_message:
+        return jsonify({'error': 'Please provide text or an image.'}), 400
+
+    try:
+        # Construct the User's Content Part
+        user_parts = []
+        
+        # Add text if present
+        if user_message:
+            user_parts.append({"text": user_message})
+            
+        # Add image if present
+        if file and file.filename != '':
+            image_bytes = file.read()
+            image_b64 = base64.b64encode(image_bytes).decode('utf-8')
+            user_parts.append({
+                "inline_data": {
+                    "mime_type": "image/jpeg", # Assuming JPEG/PNG
+                    "data": image_b64
+                }
+            })
+            
+        # If history is empty, prepend the Manuals Context to the first message
+        if not CHAT_HISTORY:
+            # We add it as a separate text part or pre-prompt the first user message
+            # Putting it in the first user message is a standard trick if System Instructions aren't used.
+            # But let's try to keep it clean: prepend context to the text of the first message.
+            manuals_intro = get_manuals_instruction()
+            if user_parts and "text" in user_parts[0]:
+                 user_parts[0]["text"] = manuals_intro + "\n\nUser Question: " + user_parts[0]["text"]
+            else:
+                user_parts.insert(0, {"text": manuals_intro})
+
+        # Append user turn to history
+        current_user_turn = {
+            "role": "user",
+            "parts": user_parts
+        }
+        CHAT_HISTORY.append(current_user_turn)
+
+        # Construct payload with full history
+        payload = {
+            "contents": CHAT_HISTORY,
+            "generation_config": {
+                "temperature": 0.4,
+                "max_output_tokens": 8192,
+                "top_p": 1,
+                "top_k": 32
+            }
+        }
+        
+        # Headers/Params
+        params = {"key": API_KEY}
+        headers = {"Content-Type": "application/json"}
+
+        print(f"Sending request to {ENDPOINT_URL}...")
+        response = requests.post(ENDPOINT_URL, params=params, json=payload, headers=headers)
+        
+        if response.status_code != 200:
+            print(f"API Error: {response.text}")
+            # If error, remove the last user turn so they can retry without corrupting state
+            CHAT_HISTORY.pop() 
+            return jsonify({'error': f"API Error {response.status_code}: {response.text}"}), response.status_code
+            
+        result = response.json()
+        
+        # Parse Gemini response
+        try:
+            # Get model text
+            solution_text = result['candidates'][0]['content']['parts'][0]['text']
+            
+            # Append model turn to history
+            CHAT_HISTORY.append({
+                "role": "model",
+                "parts": [{"text": solution_text}]
+            })
+            
+            return jsonify({'solution': solution_text})
+        except (KeyError, IndexError) as e:
+            print(f"Parsed Error: {e}, Response: {result}")
+            CHAT_HISTORY.pop() # Rollback user turn
+            return jsonify({'solution': "Error parsing AI response. Check logs."})
+
+    except Exception as e:
+        print(f"Error during generation: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/clear', methods=['POST'])
+def clear_history():
+    global CHAT_HISTORY
+    CHAT_HISTORY = []
+    print("History cleared.")
+    return jsonify({'status': 'cleared'})
+
+if __name__ == '__main__':
+    load_manuals()
+    app.run(debug=True, port=5000)
+
+# Ensure manuals are loaded on cold start in cloud
+load_manuals()
+
+@https_fn.on_request(
+    memory=1024,
+    timeout_sec=300,
+    region="us-central1"
+)
+def api(req: https_fn.Request) -> Response:
+    with app.request_context(req.environ):
+        return app.full_dispatch_request()

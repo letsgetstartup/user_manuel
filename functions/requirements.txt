@@ -1,0 +1,9 @@
+flask
+requests
+pypdf
+google-cloud-aiplatform
+google-generativeai
+firebase-admin
+firebase-functions
+pymupdf
+Pillow
