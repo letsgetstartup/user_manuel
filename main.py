@@ -175,9 +175,21 @@ def save_tutorial_to_db(slug, data):
 
 # --- 4. UI COMPONENTS ---
 
+# --- 4. UI COMPONENTS ---
+
 def render_sidebar():
     with st.sidebar:
         st.header("🗄️ History")
+        
+        # --- DB STATUS DEBUG ---
+        try:
+            tutorials_ref = db.collection("tutorials")
+            count = len(list(tutorials_ref.stream()))
+            st.success(f"🟢 Database Connected\nCached Guides: {count}")
+        except Exception as e:
+            st.error(f"🔴 DB Connection Error: {e}")
+        # -----------------------
+
         if st.button("➕ New Chat", use_container_width=True):
             st.session_state.session_id = str(uuid.uuid4())
             st.session_state.messages = []
@@ -280,8 +292,10 @@ def main():
                     docs = db.collection("tutorials").stream()
                     existing_slugs = [doc.id for doc in docs]
                     status.write(f"Checking against {len(existing_slugs)} existing guides...")
-                except Exception:
-                    pass
+                except Exception as e:
+                    # CRITICAL: Do not silent fail. Report this.
+                    st.error(f"Failed to fetch existing topics: {e}")
+                    status.write("⚠️ DB Read Failed - Cache disabled.")
 
                 router_model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=ROUTER_SYSTEM_INSTRUCTION)
                 
