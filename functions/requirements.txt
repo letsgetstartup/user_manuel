@@ -1,9 +1,8 @@
 flask
-requests
-pypdf
-google-cloud-aiplatform
-google-generativeai
-firebase-admin
 firebase-functions
+firebase-admin
+google-cloud-aiplatform>=1.38.0
 pymupdf
+google-cloud-storage
 Pillow
+werkzeug

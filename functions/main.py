@@ -1,393 +1,291 @@
 import os
-import glob
-from urllib.parse import quote
-import base64
-import requests
-import json
 import io
-import time
-import uuid
-from flask import Flask, render_template, request, jsonify, session
+import logging
+from flask import Flask, request, jsonify, session
 from firebase_functions import https_fn
 from werkzeug.wrappers import Response
-import fitz  # PyMuPDF
 from PIL import Image
 
-# Vertex AI Imports
+# Vertex AI & Firebase Imports
+# Vertex AI & Firebase Imports
 import vertexai
-from vertexai.generative_models import GenerativeModel, Part, HarmCategory, HarmBlockThreshold
+from vertexai.generative_models import GenerativeModel, Part, Tool, grounding
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
-from datetime import datetime, timedelta
+from google.cloud import storage as gcs
+import fitz # PyMuPDF
+import re
 
-# Configuration
-PROJECT_ID = "manualai-481406"
-LOCATION = "us-central1" 
-MANUALS_DIR = "manuals"
-
+# --- CONFIGURATION ---
+# Based on your screenshots:
+PROJECT_ID = "manualai-481406" 
+# CRITICAL: Vertex AI Model needs 'us-central1', but Data Store is in 'eu'
+VERTEX_REGION = "us-central1"
+DATA_STORE_REGION = "eu"
+DATA_STORE_ID = "manual02_1765869275504" # The exact ID from your screenshot [cite: 8]
 
 # Initialize Firebase
 if not firebase_admin._apps:
-    firebase_admin.initialize_app(options={
-        'storageBucket': "manualai-481406.firebasestorage.app"
-    })
-
-def init_vertex():
-    vertexai.init(project=PROJECT_ID, location=LOCATION)
-
+    firebase_admin.initialize_app()
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
-# --- PROMPTS ---
+# Setup Logging
+logging.basicConfig(level=logging.INFO)
 
-NANO_BANANA_PROMPT = """
-Create a copy of the attached image based on the following prompt:
+def init_vertex():
+    """Initializes Vertex AI with the correct region."""
+    vertexai.init(project=PROJECT_ID, location=VERTEX_REGION)
 
-Role & Goal: You are UI Engineer. Your goal is to create a 1:1 pixel-perfect replica of the attached image. You must prioritize data accuracy and structural integrity over artistic interpretation.
 
-Replicate the exact window title
-Exact Labels & Values (Row-by-Row): You MUST display the data exactly as written, without any changes or generalizations 
-Icons - copy exactly where they appear in the source.
+# --- SYSTEM INSTRUCTIONS ---
+# We removed the 'Refusal' instruction. Now we encourage using the tools.
+TECH_SUPPORT_INSTRUCTION = """
+You are an expert Technical Support Engineer for security camera systems (Hikvision, Dahua, etc.).
+Your goal is to troubleshoot issues based ONLY on the provided user image and the official technical manuals.
 
-DO NOT use placeholder text or "lorem ipsum".
-DO NOT generalize numbers or IP addresses.
-DO NOT add artistic lighting, reflections, or textures.
-DO NOT simplify the diagram; if there are 8 rows in the source, there must be exactly 8 rows in the output.
-Final Quality Check: The final image must be a high-resolution scan of the attached image Every number, dot, icon and line must match the provided specification.
+PROTOCOL:
+1. ANALYZE: Look at the user's uploaded image (if provided) to identify error codes, interface icons, or hardware models.
+2. SEARCH: Use the 'GoogleSearchRetrieval' tool to find specific troubleshooting steps in the connected Data Store.
+3. SYNTHESIZE: Combine the visual evidence with the manual's text.
+4. CITE: When you provide a solution, mention which manual or section the information came from.
+
+If the answer is not in the manuals, state that clearly. Do not make up information.
 """
 
-ROUTER_SYSTEM_INSTRUCTION = """
-You are a Technical Support Dispatcher. Your ONLY job is to categorize the request.
-CRITICAL: NEVER provide technical instructions, answers, or data from the manual in this phase. 
-
-Your ONLY allowed response is a JSON object with one of these actions:
-1. **Identify**: Use this for ANY request related to "How to", "Help with", or specific procedures in the manual. 
-   - State clearly: "I understand you need help with [Task]. Should I generate the step-by-step tutorial?"
-   - Topic Slug: unique_snake_case_name.
-2. **Clarify**: Use if the request is gibberish or too broad. 
-3. **Chat**: ONLY for "Hello", "How are you", or non-technical chatter.
-
-If you provide a technical answer instead of asking for confirmation, you HAVE FAILED.
-"""
-
-GENERATOR_SYSTEM_INSTRUCTION = """
-You are an expert Technical Support Guide. Create a structured JSON tutorial based on the PDF manuals.
-Output ONLY JSON in English.
-
-You MUST follow this JSON Format:
-{
-  "title": "Human Readable Title",
-  "topic_slug": "same_slug_as_input",
-  "intro": "Brief explanation of the goal.",
-  "steps": [
-    {
-      "step_number": 1,
-      "instruction": "Detailed text instruction. Reference specific icons or menu names from the manual.",
-      "pdf_page_reference": 38,
-      "has_visual": true
-    }
-  ]
-}
-
-Important: Identify the EXACT page numbers for visuals. If page 38 contains the diagram for the task, use 38.
-"""
-
-@app.route('/api/debug/extraction')
-def debug_extraction():
-    """Debug route to inspect file system and PDF path resolution."""
-    try:
-        cwd = os.getcwd()
-        ls_cwd = os.listdir(cwd)
-        
-        # Check manuals dir existence
-        manuals_path = os.path.join(cwd, MANUALS_DIR)
-        manuals_exists = os.path.exists(manuals_path)
-        ls_manuals = os.listdir(manuals_path) if manuals_exists else "Directory Not Found"
-        
-        # Check glob
-        pdf_pattern = os.path.join(MANUALS_DIR, "*.pdf")
-        glob_results = glob.glob(pdf_pattern)
-        
-        # Attempt minimal extraction
-        extraction_status = "Skipped"
-        if glob_results:
-            try:
-                doc = fitz.open(glob_results[0])
-                page = doc.load_page(37) # Page 38 (0-indexed)
-                pix = page.get_pixmap(dpi=72)
-                extraction_status = f"Success - Image size: {pix.width}x{pix.height}"
-            except Exception as e:
-                extraction_status = f"Failed: {str(e)}"
-
-        return jsonify({
-            "cwd": cwd,
-            "ls_cwd": ls_cwd,
-            "manuals_path": manuals_path,
-            "manuals_exists": manuals_exists,
-            "ls_manuals": ls_manuals,
-            "glob_pattern": pdf_pattern,
-            "glob_results": glob_results,
-            "extraction_test": extraction_status
-        })
-    except Exception as e:
-        return jsonify({"fatal_error": str(e)})
-
-@app.route('/api/debug/upload')
-def debug_upload():
-    """Debug route to test Storage Upload permissions."""
-    try:
-        # Create a dummy image
-        img = Image.new('RGB', (100, 100), color = 'blue')
-        filename = f"debug_upload_real_{uuid.uuid4().hex[:8]}.png"
-        
-        # Call the REAL function
-        url = upload_to_storage(img, filename)
-        
-        if url:
-             return f"<h1>Upload Success!</h1><p>URL: <a href='{url}'>{url}</a></p><img src='{url}'>"
-        else:
-             return "<h1>Upload Failed</h1><p>returned None. Check logs.</p>"
-
-    except Exception as e:
-        return f"<h1>Fatal Upload Error</h1><p>{e}</p>"
-
-    except Exception as e:
-        return f"<h1>Fatal Upload Error</h1><p>{e}</p>"
-
-# --- HELPERS ---
-def get_db():
-    return firestore.client()
-
-def get_bucket():
-    return storage.bucket()
-
-
-# --- HELPER FUNCTIONS ---
-def get_pdf_files():
-    files = glob.glob(os.path.join(MANUALS_DIR, "*.pdf"))
-    # Sort by size (largest first) to prioritize the full User Manual over Datasheets
-    files.sort(key=lambda x: os.path.getsize(x), reverse=True)
-    return files
-
-def upload_pdf_to_gcs_if_needed(local_path):
-    """Uploads PDF to GCS/Firebase Storage and returns the gs:// URI."""
-    try:
-        bucket = get_bucket()
-        filename = os.path.basename(local_path)
-        blob = bucket.blob(f"manuals/{filename}")
-        
-        # Check if exists (optional optimization, but good for speed)
-        if not blob.exists():
-            print(f"Uploading {filename} to Storage...")
-            blob.upload_from_filename(local_path)
-        
-        return f"gs://{bucket.name}/manuals/{filename}"
-    except Exception as e:
-        print(f"PDF Upload Error: {e}")
-        return None
-
-def extract_image_from_pdf(page_number):
-    try:
-        pdf_files = get_pdf_files()
-        if not pdf_files: 
-            print("Error: No PDF manuals found in manuals/ directory.")
-            return None
-        
-        # Open the first available manual
-        doc = fitz.open(pdf_files[0])
-        
-        if page_number < 1 or page_number > len(doc):
-             print(f"Error: Page {page_number} out of range (1-{len(doc)}).")
-             return None
-             
-        page = doc.load_page(page_number - 1)
-        
-        # Smart Extraction Logic
-        image_list = page.get_images(full=True)
-        largest_area = 0
-        best_rect = None
-        
-        for img in image_list:
-            xref = img[0]
-            rects = page.get_image_rects(xref)
-            for rect in rects:
-                if rect.width < 100 or rect.height < 100:
-                    continue
-                area = rect.width * rect.height
-                if area > largest_area:
-                    largest_area = area
-                    best_rect = rect
-        
-        if best_rect:
-            pix = page.get_pixmap(clip=best_rect, dpi=200)
-        else:
-            pix = page.get_pixmap(dpi=200)
-
-        img_data = pix.tobytes("png")
-        return Image.open(io.BytesIO(img_data))
-    except Exception as e:
-        print(f"Extraction error: {e}")
-        return None
-
-def upload_to_storage(image_obj, filename):
-    try:
-        bucket = get_bucket()
-        blob = bucket.blob(f"generated_assets/{filename}")
-        img_byte_arr = io.BytesIO()
-        image_obj.save(img_byte_arr, format='PNG')
-        blob.upload_from_string(img_byte_arr.getvalue(), content_type='image/png')
-        blob.upload_from_string(img_byte_arr.getvalue(), content_type='image/png')
-        # blob.make_public() <- Causes 403 on Uniform Access Buckets
-        blob.upload_from_string(img_byte_arr.getvalue(), content_type='image/png')
-        
-        # Construct Firebase Download URL manually to bypass AIM/GCS public restrictions
-        # Format: https://firebasestorage.googleapis.com/v0/b/{bucket}/o/{path}?alt=media
-        encoded_path = quote(f"generated_assets/{filename}", safe='')
-        firebase_url = f"https://firebasestorage.googleapis.com/v0/b/{bucket.name}/o/{encoded_path}?alt=media"
-        
-        return firebase_url
-    except Exception as e:
-        print(f"Upload error: {e}")
-        return None
-
-def upload_user_image_to_gcs(image_file):
-    """Uploads user uploaded image to GCS and returns gs:// URI."""
-    try:
-        bucket = get_bucket()
-        u_id = uuid.uuid4().hex
-        blob = bucket.blob(f"user_uploads/{u_id}.png")
-        blob.upload_from_string(image_file.read(), content_type='image/png')
-        image_file.seek(0) # Reset pointer
-        return f"gs://{bucket.name}/user_uploads/{u_id}.png"
-    except Exception as e:
-        print(f"User Image Upload Error: {e}")
-        return None
-
-
-# --- API ROUTES ---
+# --- ROUTES ---
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return "Antigravity Copilot Backend is Running (Grounding Enabled)."
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze():
-    init_vertex()
-    user_message = request.form.get('message', '')
-    image_file = request.files.get('image')
-    
-    print(f"DEBUG: Processing message: '{user_message}'")
-    
-    awaiting = session.get('awaiting_confirmation')
-    
+    """
+    Main analysis endpoint.
+    Receives text and/or image -> Queries Vertex AI with Grounding -> Returns Answer.
+    """
     try:
-        # Normalize message for checks
-        u_msg_lower = user_message.lower()
+        init_vertex()
         
-        # --- 1. LAYER 0: IMMEDIATE TECHNICAL INTERCEPTION ---
-        # Detect technical intent BEFORE any other logic.
-        tech_words = ["how", "explain", "activate", "connect", "step", "tutorial", "manual", "guide", "help", "camera", "ip", "monitor", "nvr", "password", "reset"]
+        user_message = request.form.get('message', '')
+        image_file = request.files.get('image')
         
-        # Check if user is confirming a pending request (allow "yes" to pass)
-        is_confirming_flow = False
-        confirmations = ["yes", "proceed", "go", "ahead", "ok", "confirm", "sure", "do it", "right", "correct", "yeah", "yep"]
-        if awaiting and any(w in u_msg_lower for w in confirmations):
-            is_confirming_flow = True
+        logging.info(f"Processing request: '{user_message}' | Image present: {bool(image_file)}")
 
-        # IF NOT confirming AND (keywords present OR long input) -> TRAP IT
-        if not is_confirming_flow and (any(w in u_msg_lower for w in tech_words) or len(user_message.split()) > 3):
-            print("Technical intent detected (Layer 0). Forcing Identification phase.")
+        # --- CONFIGURE GROUNDING TOOL (Available for all paths) ---
+        grounding_tool = Tool.from_retrieval(
+            grounding.Retrieval(
+                source=grounding.VertexAISearch(
+                    datastore=f"projects/{PROJECT_ID}/locations/{DATA_STORE_REGION}/collections/default_collection/dataStores/{DATA_STORE_ID}"
+                )
+            )
+        )
+
+        if not user_message and not image_file:
+             return jsonify({'solution': "Please provide a description or an image of the error."})
+
+        # Check for Confirmation Keywords
+        CONFIRMATION_KEYWORDS = ["yes", "go ahead", "ok", "please", "sure", "generate"]
+        is_confirmation = any(word in user_message.lower() for word in CONFIRMATION_KEYWORDS) if user_message else False
+        
+        # --- PATH 1: TUTORIAL GENERATION (JSON) ---
+        if is_confirmation:
+            context = session.get('last_analysis', '')
+            if not context and not image_file:
+                 return jsonify({'solution': "I don't have context on what to generate. Please describe the problem first."})
             
-            # Quick topic identification
-            topic_model = GenerativeModel("gemini-2.5-pro")
-            topic_res = topic_model.generate_content(f"Identify the technical procedure in one word (snake_case): '{user_message}'")
-            slug = topic_res.text.strip().replace(" ", "_").lower()
+            logging.info("Generating JSON Tutorial...")
             
-            session['awaiting_confirmation'] = slug
+            # Use a specialized model for JSON generation
+            tutorial_model = GenerativeModel(
+                "gemini-2.5-pro",
+                system_instruction="""
+                You are a technical documentation expert.
+                Generate a structured JSON tutorial based on the user's request and context.
+                
+                The JSON MUST follow this exact schema:
+                {
+                    "tutorial": {
+                        "title": "Title of the Guide",
+                        "intro": "Brief introduction.",
+                        "steps": [
+                            {
+                                "step_number": 1,
+                                "instruction": "Clear instruction.",
+                                "page_number": 10,
+                                "has_visual": true,
+                                "image_url": "" 
+                            }
+                        ]
+                    }
+                }
+                
+                NOTE: You MUST identify the Page Number in the manual where this step is described and include it as "page_number" (integer). If you cannot find the page, omit the field.
+                NOTE: Leave 'image_url' empty and 'has_visual' false initially; the system will fill them based on "page_number".
+                """,
+                tools=[grounding_tool]
+            )
+            
+            prompt = f"Context: {context}\nUser Request: {user_message}\nGenerate a step-by-step tutorial in JSON format."
+            
+            response = tutorial_model.generate_content(
+                [prompt],
+                generation_config={"response_mime_type": "application/json"}
+            )
+            
+            import json
+            import json
+            try:
+                # Handle potentially multipart responses (e.g. text + citations)
+                full_text = ""
+                if response.candidates and response.candidates[0].content.parts:
+                    for part in response.candidates[0].content.parts:
+                        if part.text:
+                            full_text += part.text
+                else:
+                    full_text = response.text # Fallback logic
+
+                # Clean up response text to ensure valid JSON
+                text_response = full_text.strip()
+                
+                # Try to find JSON block using regex
+                json_match = re.search(r'\{.*\}', text_response, re.DOTALL)
+                if json_match:
+                    text_response = json_match.group(0)
+                elif text_response.startswith("```json"):
+                    text_response = text_response[7:-3]
+                elif text_response.startswith("```"): # Generic block
+                     text_response = text_response[3:-3]
+                
+                tutorial_data = json.loads(text_response)
+
+                # --- PDF IMAGE EXTRACTION LOGIC ---
+                manual_uri = session.get('manual_uri')
+                if manual_uri and 'gs://' in manual_uri:
+                    logging.info(f"Attempting to extract images from: {manual_uri}")
+                    try:
+                        # Parse correct bucket/blob from gs:// URI
+                        # URI format: gs://bucket_name/path/to/file.pdf
+                        match = re.match(r'gs://([^/]+)/(.+)', manual_uri)
+                        if match:
+                            source_bucket_name = match.group(1)
+                            source_blob_name = match.group(2)
+
+                            # Download PDF from Source GCS
+                            storage_client = gcs.Client()
+                            source_bucket = storage_client.bucket(source_bucket_name)
+                            blob = source_bucket.blob(source_blob_name)
+                            pdf_bytes = blob.download_as_bytes()
+                            
+                            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                            output_bucket = storage.bucket() # Default Firebase bucket
+                            
+                            for step in tutorial_data.get('tutorial', {}).get('steps', []):
+                                page_num = step.get('page_number')
+                                
+                                # Only process if we have a page number
+                                if page_num is not None and isinstance(page_num, int):
+                                    try:
+                                        # Convert 1-based page number to 0-based index
+                                        page_idx = page_num - 1
+                                        if 0 <= page_idx < len(doc):
+                                            page = doc[page_idx]
+                                            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2)) # 2x zoom for quality
+                                            img_data = pix.tobytes("png")
+                                            
+                                            # Upload to Firebase Storage
+                                            # Use a unique path
+                                            filename = f"generated_visuals/{session.get('session_id', 'anon')}_{step['step_number']}_{page_num}.png"
+                                            blob_out = output_bucket.blob(filename)
+                                            blob_out.upload_from_string(img_data, content_type='image/png')
+                                            blob_out.make_public()
+                                            
+                                            step['image_url'] = blob_out.public_url
+                                            step['has_visual'] = True
+                                            logging.info(f"Generated visual for Step {step['step_number']} from Page {page_num}")
+                                    except Exception as inner_e:
+                                        logging.error(f"Failed to extract page {page_num}: {inner_e}")
+                    except Exception as e:
+                        logging.error(f"Global PDF extraction failed: {e}")
+
+                return jsonify(tutorial_data)
+            except (json.JSONDecodeError, AttributeError): # AttributeError in case json_match is None but we try to continue
+                logging.error("Failed to parse JSON response")
+                return jsonify({'solution': "Error generating tutorial format. Here is the raw text:\n" + full_text})
+
+        # --- PATH 2: ANALYSIS & CONFIRMATION (TEXT) ---
+        else:
+            # 1. Prepare Multimodal Content
+            content_parts = []
+            if user_message:
+                content_parts.append(user_message)
+            else:
+                content_parts.append("Analyze this technical issue.")
+
+            if image_file:
+                img = Image.open(image_file)
+                img_byte_arr = io.BytesIO()
+                img.save(img_byte_arr, format='PNG')
+                img_bytes = img_byte_arr.getvalue()
+                part_image = Part.from_data(data=img_bytes, mime_type="image/png")
+                content_parts.append(part_image)
+
+            # 3. Initialize Model
+            model = GenerativeModel(
+                "gemini-2.5-pro",
+                system_instruction=TECH_SUPPORT_INSTRUCTION + "\nIMPORTANT: Identify the problem, then END your response by asking: 'Shall I generate a step-by-step tutorial with diagrams?'",
+                tools=[grounding_tool]
+            )
+
+            # 4. Generate Response
+            response = model.generate_content(
+                content_parts,
+                generation_config={
+                    "temperature": 0.2,
+                    "max_output_tokens": 1024
+                }
+            )
+
+            answer_text = response.text
+            
+            # Extract source URI from Grounding Metadata
+            source_uri = ""
+            try:
+                if response.candidates and response.candidates[0].grounding_metadata:
+                    gm = response.candidates[0].grounding_metadata
+                    if gm.grounding_chunks:
+                        for chunk in gm.grounding_chunks:
+                            if chunk.retrieved_context and chunk.retrieved_context.uri:
+                                source_uri = chunk.retrieved_context.uri
+                                break # Take the first valid citation
+            except Exception as e:
+                logging.error(f"Error extracting source URI: {e}")
+
+            # Store context for the next turn
+            session['last_analysis'] = f"User Image/Issue Analysis: {answer_text}"
+            session['manual_uri'] = source_uri
+            if 'session_id' not in session:
+                session['session_id'] = os.urandom(8).hex()
+            session.modified = True
+
             return jsonify({
-                'solution': f"I understand you want to learn about **{slug.replace('_', ' ')}**. Should I generate the step-by-step tutorial with technical diagrams from the manual?"
+                'solution': answer_text,
+                'grounded': True
             })
 
-        # --- 2. CONFIRMATION & GENERATION LOGIC ---
-        if awaiting:
-            if is_confirming_flow:
-                print(f"Confirmed! Running Generation Pipeline for {awaiting}...")
-                session['awaiting_confirmation'] = None
-                
-                # Check Cache
-                db = get_db()
-                cached = db.collection("tutorials").document(awaiting).get()
-                if cached.exists:
-                    return jsonify({'tutorial': cached.to_dict()})
-
-                # Prepare context
-                pdf_files = get_pdf_files()
-                context_parts = []
-                if pdf_files:
-                     # Upload PDF to GCS/Firebase Storage if needed
-                     pdf_uri = upload_pdf_to_gcs_if_needed(pdf_files[0])
-                     if pdf_uri:
-                         context_parts.append(Part.from_uri(pdf_uri, mime_type="application/pdf"))
-                
-                if image_file:
-                     # Upload User Image to GCS
-                     img_uri = upload_user_image_to_gcs(image_file)
-                     if img_uri:
-                         context_parts.append(Part.from_uri(img_uri, mime_type="image/png"))
-                
-                # Generate Tutorial Structure
-                gen_model = GenerativeModel("gemini-2.5-pro", system_instruction=GENERATOR_SYSTEM_INSTRUCTION)
-                gen_res = gen_model.generate_content(
-                    context_parts + [f"Task: Generate tutorial for {awaiting}. Reference page 38 for IP camera visuals."], 
-                    generation_config={"response_mime_type": "application/json"}
-                )
-                tutorial = json.loads(gen_res.text)
-                
-                # NANO BANANA MULTIMODAL PIPELINE
-                print(f"Executing Nano Banana Pipeline with Prompt: {NANO_BANANA_PROMPT.strip()[:50]}...")
-                for step in tutorial.get('steps', []):
-                    if step.get('has_visual'):
-                        page_ref = step.get('pdf_page_reference')
-                        print(f"Applying Nano Banana to visual from page {page_ref}...")
-                        
-                        raw_img_pil = extract_image_from_pdf(page_ref)
-                        if raw_img_pil:
-                            # Save and Upload
-                            u_id = uuid.uuid4().hex[:8]
-                            fname = f"{awaiting}_step_{step['step_number']}_{u_id}.png"
-                            url = upload_to_storage(raw_img_pil, fname)
-                            if url:
-                                step['image_url'] = url
-                            else:
-                                step['image_error'] = "Upload returned None (check logs)"
-                        else:
-                            step['image_error'] = f"Extraction failed for Page {page_ref} (PDF not found or page out of range)"
-                
-                db.collection("tutorials").document(awaiting).set(tutorial)
-                return jsonify({'tutorial': tutorial})
-            else:
-                # User said something else while waiting, assuming they cancelled or are chatting
-                print("Confirmation not found. Resetting state.")
-                session['awaiting_confirmation'] = None
-
-        # --- 3. FALLBACK CHAT (Refusal Mode) ---
-        # CRITICAL: We instruct the chat model to REFUSE technical questions if they slip through.
-        chat_model = GenerativeModel("gemini-2.5-pro", system_instruction="You are a polite assistant. If the user asks about technical support, manuals, cameras, or troubleshooting, YOU MUST REFUSE and say: 'I can only help if you confirm you want a tutorial. Please ask to identify the task again.'")
-        chat_res = chat_model.generate_content(user_message)
-        return jsonify({'solution': f"{chat_res.text} (DEBUG: Chat Fallback Triggered - Interception Failed)"})
-
     except Exception as e:
-        print(f"API Error: {e}")
-        return jsonify({'error': str(e)}), 500
+        logging.error(f"Analysis Error: {e}")
+        return jsonify({'error': str(e), 'solution': "I encountered a system error while checking the manuals."}), 500
 
 @app.route('/api/clear', methods=['POST'])
 def clear_history():
     session.clear()
-    print("Session cleared.")
     return jsonify({'status': 'cleared'})
 
-@https_fn.on_request(memory=1024, timeout_sec=600, region="us-central1")
+# Firebase Cloud Function Entry Point
+@https_fn.on_request(memory=1024, timeout_sec=60, region="us-central1")
 def api(req: https_fn.Request) -> Response:
     with app.request_context(req.environ):
         return app.full_dispatch_request()
