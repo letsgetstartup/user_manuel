@@ -277,24 +277,33 @@ def main():
                 existing_slugs = []
                 try:
                     # Get all document IDs from the tutorials collection
-                    # Note: For large datasets, this approach needs optimization (e.g., retrieval-augmented generation)
                     docs = db.collection("tutorials").stream()
                     existing_slugs = [doc.id for doc in docs]
+                    status.write(f"Checking against {len(existing_slugs)} existing guides...")
                 except Exception:
                     pass
 
                 router_model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=ROUTER_SYSTEM_INSTRUCTION)
                 
-                # Context-Aware Prompting
+                # Context-Aware Prompting (Strict Mode)
                 router_prompt = f"""
-                User Query: "{last_msg}"
-                
-                Existing Topics in DB: {json.dumps(existing_slugs)}
-                
-                Instructions:
-                1. Check if the User Query aligns with any of the "Existing Topics".
-                2. If it does, MUST return that exact topic_slug.
-                3. If not, generate a new, descriptive snake_case slug.
+                ROLE: Library Archivist.
+                GOAL: Match the user's query to an existing TOPIC in the DATABASE.
+
+                DATABASE OF EXISTING TOPICS:
+                {json.dumps(existing_slugs)}
+
+                USER QUERY: "{last_msg}"
+
+                INSTRUCTIONS:
+                1. SEARCH the DATABASE for a topic that matches the user's intent.
+                2. DECISION:
+                   - IF a match is found: RETURN the EXACT topic_slug from the database.
+                   - IF NO match is found: Generate a NEW, concise, snake_case slug.
+
+                Rules:
+                - Do NOT generate a new slug if a semantically similar one exists.
+                - Output JSON ONLY.
                 """
                 
                 # Deterministic Output
