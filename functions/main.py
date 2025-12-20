@@ -192,19 +192,44 @@ def analyze():
                                         page_idx = page_num - 1
                                         if 0 <= page_idx < len(doc):
                                             page = doc[page_idx]
-                                            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2)) # 2x zoom for quality
-                                            img_data = pix.tobytes("png")
+                                            image_list = page.get_images()
                                             
-                                            # Upload to Firebase Storage
-                                            # Use a unique path
-                                            filename = f"generated_visuals/{session.get('session_id', 'anon')}_{step['step_number']}_{page_num}.png"
-                                            blob_out = output_bucket.blob(filename)
-                                            blob_out.upload_from_string(img_data, content_type='image/png')
-                                            blob_out.make_public()
+                                            # Find the best image on the page
+                                            best_image = None
+                                            max_area = 0
                                             
-                                            step['image_url'] = blob_out.public_url
-                                            step['has_visual'] = True
-                                            logging.info(f"Generated visual for Step {step['step_number']} from Page {page_num}")
+                                            for img in image_list:
+                                                xref = img[0]
+                                                width = img[2]
+                                                height = img[3]
+                                                
+                                                # Filter out small icons/logos (e.g. < 100px dimension)
+                                                if width > 100 and height > 100:
+                                                    area = width * height
+                                                    if area > max_area:
+                                                        max_area = area
+                                                        best_image = img
+                                            
+                                            if best_image:
+                                                xref = best_image[0]
+                                                base_image = doc.extract_image(xref)
+                                                img_data = base_image["image"]
+                                                img_ext = base_image["ext"]
+                                                
+                                                # Upload to Firebase Storage
+                                                filename = f"generated_visuals/{session.get('session_id', 'anon')}_{step['step_number']}_{page_num}.{img_ext}"
+                                                blob_out = output_bucket.blob(filename)
+                                                blob_out.upload_from_string(img_data, content_type=f"image/{img_ext}")
+                                                blob_out.make_public()
+                                                
+                                                step['image_url'] = blob_out.public_url
+                                                step['has_visual'] = True
+                                                logging.info(f"Extracted image {xref} for Step {step['step_number']} from Page {page_num}")
+                                            else:
+                                                # No significant image found on page, disable visual for this step
+                                                step['has_visual'] = False
+                                                step['image_url'] = ""
+                                                logging.info(f"No suitable image found on Page {page_num} for Step {step['step_number']}")
                                     except Exception as inner_e:
                                         logging.error(f"Failed to extract page {page_num}: {inner_e}")
                     except Exception as e:
