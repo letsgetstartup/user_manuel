@@ -280,6 +280,41 @@ def analyze_image_for_query(image_file, user_message):
         logging.error(f"Vision Analysis Failed: {e}")
         return user_message # Fallback
 
+def generate_canonical_slug(user_query):
+    """
+    Uses Gemini to generate a consistent, canonical slug for a user query.
+    Example: "How to add an IP camera" -> "add_ip_camera"
+    Example: "Adding a camera" -> "add_ip_camera"
+    """
+    try:
+        logging.info(f"Generating Canonical Slug for: {user_query}")
+        init_vertex()
+        model = GenerativeModel("gemini-1.5-flash")
+        
+        prompt = f"""
+        Task: Convert the following user technical support query into a consistent, snake_case unique identifier (slug).
+        
+        Input Query: "{user_query}"
+        
+        Rules:
+        1. Use snake_case (e.g., "reset_password", "connection_failure").
+        2. Be GENERAL and CANONICAL. 
+           - "How do I add a camera" -> "add_ip_camera"
+           - "Adding new IP camera" -> "add_ip_camera"
+           - "My NVR is beeping" -> "nvr_beeping_sound"
+           - "Beeping noise from NVR" -> "nvr_beeping_sound"
+        3. Output ONLY the slug. No json, no quotes, no markdown.
+        """
+        
+        res = model.generate_content(prompt)
+        slug = res.text.strip().lower().replace("```", "").replace("\n", "")
+        logging.info(f"Canonical Slug Result: {slug}")
+        return slug
+    except Exception as e:
+        logging.error(f"Slug Generation Error: {e}")
+        # Fallback to a basic sanitization if AI fails
+        return re.sub(r'[^a-zA-Z0-9_]', '_', user_query.lower())[:50]
+
 # --- HELPER FUNCTIONS ---
 
 def get_tutorial_from_db(slug):
@@ -478,7 +513,6 @@ def analyze():
         if not user_message and not image_file:
              return jsonify({'solution': "Please describe the issue."})
 
-
         # --- TEST HOOK: FORCE IMAGE TEST ---
         if user_message and user_message.lower().strip() == "force test images":
             try:
@@ -497,58 +531,24 @@ def analyze():
                 mock_data = {
                     "title": f"TEST TUTORIAL: {test_title}",
                     "topic_slug": "test_image_extraction",
-                    "intro": f"This is a FORCED TEST to verify image extraction from: {test_uri}. (DEBUG: Grounding URI: {test_uri})",
+                    "intro": f"This is a FORCED TEST to verify image extraction from: {test_uri}.",
                     "steps": [
                         {
                             "step_number": 1,
-                            "instruction": "This step should show an image from Page 1 of the manual.",
+                            "instruction": "Step 1 instruction",
                             "page_number": 1,
-                            "has_visual": True
-                        },
-                         {
-                            "step_number": 2,
-                            "instruction": "This step should show an image from Page 2.",
-                            "page_number": 2,
                             "has_visual": True
                         }
                     ]
                 }
                 
-                # Execute Extraction
-                logging.info(f"TEST HOOK: Extracting from {test_uri}")
                 final_data = extract_and_upload_images(mock_data, test_uri)
                 return jsonify({'tutorial': final_data})
-                
             except Exception as test_e:
                 logging.error(f"TEST HOOK FAILED: {test_e}")
                 return jsonify({'solution': f"TEST HOOK FAILED: {str(test_e)}"})
         # -----------------------------------
 
-        # --- GROUNDED GENERATION PHASE ---
-        logging.info(f"Generating solution for: {user_message}")
-        
-        # Grounding Setup
-        grounding_tool = Tool.from_retrieval(
-            grounding.Retrieval(
-                source=grounding.VertexAISearch(
-                    datastore=f"projects/{PROJECT_ID}/locations/{DATA_STORE_REGION}/collections/default_collection/dataStores/{DATA_STORE_ID}"
-                )
-            )
-        )
-
-        gen_model = GenerativeModel(
-            "gemini-2.5-pro", # Use Gemini 2.5 Pro
-            system_instruction=GENERATOR_SYSTEM_INSTRUCTION,
-            tools=[grounding_tool]
-        )
-        
-        # --- SPLIT PIPELINE IMPLEMENTATION ---
-        final_query = user_message
-        
-        if image_file:
-             # Step 1: Convert Image to Query
-             final_query = analyze_image_for_query(image_file, user_message)
-        
         # --- ROUTER LOGIC ---
         history_str = request.form.get('history', '[]')
         history = []
@@ -561,162 +561,111 @@ def analyze():
         if not image_file and user_message.lower().strip() in ["yes", "y", "ok", "sure", "go ahead", "please", "generate", "confirm"]:
              is_confirmation = True
         
-        # If confirming, find the original query
+        final_query = user_message
         if is_confirmation and history:
-             # Look backwards for the last user message that wasn't a confirmation
              for msg in reversed(history):
                   if msg.get('role') == 'user':
                        content = msg.get('parts', [{}])[0].get('text', '').lower()
                        if content not in ["yes", "y", "ok", "sure", "go ahead", "please", "generate", "confirm"]:
                             final_query = msg.get('parts', [{}])[0].get('text', '')
-                            logging.info(f"Context Found: Re-using query '{final_query}'")
                             break
         
-        logging.info(f"Router: is_confirmation={is_confirmation} | Query='{final_query}'")
+        if image_file:
+             final_query = analyze_image_for_query(image_file, user_message)
 
-        # --- EXECUTION ---
-        
-        if is_confirmation or image_file: # Images always trigger generation (assumption)
-            # GENERATION MODE (JSON)
-            logging.info("Mode: GENERATION")
-             
-            # Use Gemini 2.5 Pro as requested
+        # Grounding Tool Setup
+        grounding_tool = Tool.from_retrieval(
+            grounding.Retrieval(
+                source=grounding.VertexAISearch(
+                    datastore=f"projects/{PROJECT_ID}/locations/{DATA_STORE_REGION}/collections/default_collection/dataStores/{DATA_STORE_ID}"
+                )
+            )
+        )
+
+        # --- EXECUTION MODE ---
+        if is_confirmation or image_file:
+            logging.info(f"Mode: GENERATION for Query: {final_query}")
+            
+            # 1. Smart Cache Check
+            canonical_slug = generate_canonical_slug(final_query)
+            cached_tutorial = get_tutorial_from_db(canonical_slug)
+            if cached_tutorial:
+                logging.info(f"Cache HIT for {canonical_slug}")
+                return jsonify({'tutorial': cached_tutorial})
+            
+            # 2. Generation
             gen_model = GenerativeModel(
                 "gemini-2.5-pro",
                 system_instruction=GENERATOR_SYSTEM_INSTRUCTION,
                 tools=[grounding_tool]
             )
             
-            prompt_parts = [f"Search the manuals and generate a valid JSON tutorial for: {final_query}. Output ONLY the JSON object."]
-            
-            # Safe initialization for ToolConfig
+            # Tool Config for attribution (Safe wrapper)
             tool_config = None
             try:
-                # Most robust way across versions: dictionary
-                tool_config = ToolConfig(
-                    retrieval_config={
-                        "disable_attribution": False
-                    }
-                )
-                logging.info("ToolConfig (Grounding) enabled.")
-            except Exception as config_e:
-                logging.warning(f"Could not init ToolConfig (ignoring): {config_e}")
+                tool_config = ToolConfig(retrieval_config={"disable_attribution": False})
+            except Exception as e:
+                logging.warning(f"ToolConfig initialization failed (ignoring): {e}")
             
             gen_res = gen_model.generate_content(
-                prompt_parts,
+                f"Search manuals and generate tutorial for: {final_query}",
                 generation_config={"temperature": 0.1},
                 tool_config=tool_config
             )
             
-            # ... (Rest of JSON handling code below) ...
+            response_text = extract_text_from_gemini(gen_res)
             
+            try:
+                # Handle multiple JSONs if necessary
+                if "} {" in response_text:
+                     response_text = response_text.split("} {")[0] + "}"
+                
+                tutorial_data = json.loads(response_text)
+                tutorial_data['topic_slug'] = canonical_slug
+                tutorial_data['intro'] = tutorial_data.get('intro', '') + f" (ID: {canonical_slug})"
+
+                # 3. Metadata & Image Extraction
+                source_uri = ""
+                if gen_res.candidates and gen_res.candidates[0].grounding_metadata:
+                    gm = gen_res.candidates[0].grounding_metadata
+                    if hasattr(gm, 'grounding_chunks') and gm.grounding_chunks:
+                        for chunk in gm.grounding_chunks:
+                            if chunk.retrieved_context and chunk.retrieved_context.uri:
+                                source_uri = chunk.retrieved_context.uri
+                                break
+                
+                if source_uri:
+                    if source_uri.startswith("https://storage.googleapis.com/"):
+                        source_uri = source_uri.replace("https://storage.googleapis.com/", "gs://")
+                    tutorial_data = extract_and_upload_images(tutorial_data, source_uri)
+                
+                # 4. Save & Return
+                save_tutorial_to_db(canonical_slug, tutorial_data)
+                return jsonify({'tutorial': tutorial_data})
+
+            except Exception as e:
+                logging.error(f"Generation parsing failure: {e}")
+                return jsonify({'solution': "I found the solution but had trouble formatting it. Please try asking again more specifically."})
+
         else:
             # PLANNING MODE (Text)
-            logging.info("Mode: PLANNING")
-            
-            # Mode: PLANNING (Use Gemini 2.5 Pro)
-            logging.info("Mode: PLANNING")
-            
+            logging.info(f"Mode: PLANNING for Query: {final_query}")
             plan_model = GenerativeModel(
                 "gemini-2.5-pro",
                 system_instruction=PLANNING_SYSTEM_INSTRUCTION,
                 tools=[grounding_tool]
             )
             
-            prompt_parts = [f"Verify if the manuals contain info for: {final_query}"]
-             
-            gen_res = plan_model.generate_content(
-                prompt_parts,
-                generation_config={"temperature": 0.3} # Text mode, slightly higher temp
+            plan_res = plan_model.generate_content(
+                f"Check manuals for: {final_query}",
+                generation_config={"temperature": 0.3}
             )
             
-            response_text = extract_text_from_gemini(gen_res)
-            return jsonify({'solution': response_text}) # Return text directly
-
-        # --- END ROUTER ---
-        
-        
-        try:
-             # Logic to extract Manual URI from grounding metadata
-            source_uri = ""
-            metadata_log = "METADATA: "
-            
-            if gen_res.candidates and gen_res.candidates[0].grounding_metadata:
-                gm = gen_res.candidates[0].grounding_metadata
-                metadata_log += "Found GM. "
-                
-                # Method 1: Check Chunks (Most reliable for Datastores)
-                if hasattr(gm, 'grounding_chunks') and gm.grounding_chunks:
-                    metadata_log += f"Chunks: {len(gm.grounding_chunks)}. "
-                    for i, chunk in enumerate(gm.grounding_chunks):
-                        if chunk.retrieved_context and chunk.retrieved_context.uri:
-                            source_uri = chunk.retrieved_context.uri
-                            metadata_log += f"Found URI in chunk {i}. "
-                            break
-                            
-                # Method 2: Check Web Search Sources (Fallback)
-                if not source_uri and hasattr(gm, 'search_entry_point'):
-                     metadata_log += "Found search entry point. "
-            else:
-                metadata_log += "NO GROUNDING METADATA OBJECT. "
-            
-            logging.info(metadata_log)
-            
-            # --- DEBUG INJECTION START ---
-            debug_msg = f" (DEBUG: {metadata_log} URI: {source_uri})" if source_uri else f" (DEBUG: {metadata_log})"
-            # --- DEBUG INJECTION END ---
-            
-            # Use Helper to extract JSON
-            full_text = extract_text_from_gemini(gen_res)
-            
-            try:
-                tutorial_data = json.loads(full_text)
-            except json.JSONDecodeError:
-                 # [FIX] Handle Case: Model returned multiple JSONs (e.g. "{...} {...}")
-                 # Try to split and take the first complete object
-                 if "} {" in full_text:
-                     try:
-                         # Split at the boundary and add the closing brace back to the first part
-                         first_json = full_text.split("} {")[0] + "}"
-                         logging.info("Detected multiple JSONs, using the first one.")
-                         tutorial_data = json.loads(first_json)
-                     except:
-                         # Still failed, return raw text
-                         return jsonify({'solution': full_text})
-                 else:
-                     return jsonify({'solution': full_text})
-            
-            if "solution" in tutorial_data and "steps" not in tutorial_data:
-                 # The model returned a flat solution or error message strings
-                 return jsonify(tutorial_data)
-
-            # --- IMAGE EXTRACTION ---
-            # Map 'pdf_page_reference' to 'page_number' if needed, but Prompt uses 'page_number' now
-            if source_uri:
-                tutorial_data['topic_slug'] = tutorial_data.get('topic_slug', 'generated_fix') # Ensure slug exists
-                tutorial_data = extract_and_upload_images(tutorial_data, source_uri)
-            
-            # --- SAVE TO MEMORY (Post-Gen Analysis) ---
-            if source_uri:
-                tutorial_data['source_manual_uri'] = source_uri
-            
-            # Inject Debug Message into Intro
-            if 'intro' in tutorial_data:
-                tutorial_data['intro'] += debug_msg
-            else:
-                 tutorial_data['intro'] = debug_msg
-
-            slug = tutorial_data.get('topic_slug', 'general_inquiry')
-            save_tutorial_to_db(slug, tutorial_data)
-            
-            return jsonify({'tutorial': tutorial_data})
-
-        except Exception as e:
-            logging.error(f"Generation parsing error: {e}")
-            return jsonify({'solution': "I encountered an error processing the manual. Please try again."})
+            plan_text = extract_text_from_gemini(plan_res)
+            return jsonify({'solution': plan_text})
 
     except Exception as e:
-        logging.error(f"Global Error: {e}")
+        logging.error(f"Global Analyze Error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @https_fn.on_request(memory=1024, timeout_sec=60, region="us-central1")
