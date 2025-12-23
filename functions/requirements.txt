@@ -1,7 +1,7 @@
 flask
 firebase-functions
 firebase-admin
-google-cloud-aiplatform>=1.38.0
+google-cloud-aiplatform>=1.59.0
 pymupdf
 google-cloud-storage
 Pillow

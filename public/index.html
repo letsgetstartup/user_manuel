@@ -178,10 +178,21 @@
         const fileInput = document.getElementById('fileInput');
         const userInput = document.getElementById('userInput');
         const loading = document.getElementById('loading');
+        
+        // [NEW] Context History
+        let chatHistory = [];
 
         function appendMessage(content, isUser, type = 'text') {
             const div = document.createElement('div');
             div.className = `message ${isUser ? 'user' : 'bot'}`;
+
+            // Save to History (Text only for now)
+            if (type !== 'tutorial') {
+                 chatHistory.push({
+                     role: isUser ? "user" : "model",
+                     parts: [{ text: content }]
+                 });
+            }
 
             if (type === 'tutorial') {
                 div.className = 'tutorial-card';
@@ -229,6 +240,8 @@
                     div.appendChild(p);
                 }
                 chat.appendChild(div);
+                
+                // Note: We don't verify history for images yet, but could add "Sent an image" placeholder
             } else {
                 appendMessage(text, true);
             }
@@ -238,6 +251,9 @@
 
             const formData = new FormData();
             formData.append('message', text);
+            // [NEW] Send History
+            formData.append('history', JSON.stringify(chatHistory));
+            
             if (file) formData.append('image', file);
 
             loading.innerText = "Analyzing workflow...";
