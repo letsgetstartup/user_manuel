@@ -1,8 +1,9 @@
-flask
-firebase-functions
-firebase-admin
-google-cloud-aiplatform>=1.59.0
-pymupdf
+functions-framework==3.*
 google-cloud-storage
+google-cloud-firestore
+google-genai
+pypdf
+firebase-functions
+requests
+pymupdf
 Pillow
-werkzeug

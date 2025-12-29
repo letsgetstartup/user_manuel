@@ -8,13 +8,14 @@
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             margin: 0;
             padding: 0;
-            background: #f0f2f5;
+            background: #f8fafc;
             display: flex;
             flex-direction: column;
             height: 100vh;
+            color: #0f172a;
         }
 
         .chat-container {
@@ -162,15 +163,19 @@
         </div>
     </div>
 
-    <div class="loading" id="loading">Analyzing workflow...</div>
+    <div class="loading-container">
+        <div class="loading" id="loading">Analyzing workflow...</div>
+    </div>
 
-    <div class="input-area">
-        <div class="file-btn">
-            <span class="icon">📷</span>
-            <input type="file" id="fileInput" accept="image/*" capture="environment">
+    <div class="input-area-wrapper">
+        <div class="input-area">
+            <div class="file-btn">
+                <span class="icon">📷</span>
+                <input type="file" id="fileInput" accept="image/*" capture="environment">
+            </div>
+            <input type="text" id="userInput" placeholder="Type a message (optional)...">
+            <button class="btn" onclick="sendMessage()">Send</button>
         </div>
-        <input type="text" id="userInput" placeholder="Type a message (optional)...">
-        <button class="btn" onclick="sendMessage()">Send</button>
     </div>
 
     <script>
@@ -178,7 +183,7 @@
         const fileInput = document.getElementById('fileInput');
         const userInput = document.getElementById('userInput');
         const loading = document.getElementById('loading');
-        
+
         // [NEW] Context History
         let chatHistory = [];
 
@@ -188,22 +193,22 @@
 
             // Save to History (Text only for now)
             if (type !== 'tutorial') {
-                 chatHistory.push({
-                     role: isUser ? "user" : "model",
-                     parts: [{ text: content }]
-                 });
+                chatHistory.push({
+                    role: isUser ? "user" : "model",
+                    parts: [{ text: content }]
+                });
             }
 
             if (type === 'tutorial') {
                 div.className = 'tutorial-card';
-                let html = `<div class="tutorial-title">${content.title}</div><p>${content.intro}</p>`;
+                let html = `<div class="tutorial-title">${content.title}</div><div class="tutorial-intro">${content.intro}</div>`;
                 content.steps.forEach(step => {
                     html += `
                     <div class="step">
                         <div class="step-header">Step ${step.step_number}</div>
                         <div class="step-instruction">${step.instruction}</div>
                         ${step.has_visual && step.image_url ?
-                            `<img src="${step.image_url}" alt="Visual for step ${step.step_number}">` : ''
+                            `<img class="instruction-img" src="${step.image_url}" alt="Visual for step ${step.step_number}">` : ''
                         }
                     </div>
                 `;
@@ -240,7 +245,7 @@
                     div.appendChild(p);
                 }
                 chat.appendChild(div);
-                
+
                 // Note: We don't verify history for images yet, but could add "Sent an image" placeholder
             } else {
                 appendMessage(text, true);
@@ -253,7 +258,7 @@
             formData.append('message', text);
             // [NEW] Send History
             formData.append('history', JSON.stringify(chatHistory));
-            
+
             if (file) formData.append('image', file);
 
             loading.innerText = "Analyzing workflow...";

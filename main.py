@@ -60,19 +60,24 @@ bucket = storage.bucket()
 # --- 2. PROMPT ENGINEERING ---
 
 # The "Nano Banana" Prompt for Visual consistency
-NANO_BANANA_PROMPT = """
-Role & Goal: You are UI Engineer. Your goal is to create a 1:1 pixel-perfect replica of the attached image. 
-You must prioritize data accuracy and structural integrity over artistic interpretation.
+NANO_BANANA_PROMPT = """Create a copy of the attached image based on the following prompt:
 
-Replicate the exact window title.
-Exact Labels & Values (Row-by-Row): You MUST display the data exactly as written.
+Role & Goal: You are UI Engineer. Your goal is to create a 1:1 pixel-perfect replica of the attached image. You must prioritize data accuracy and structural integrity over artistic interpretation.
+
+Replicate the exact window title
+
+Exact Labels & Values (Row-by-Row): You MUST display the data exactly as written, without any changes or generalizations 
+
 Icons - copy exactly where they appear in the source.
 
-DO NOT use placeholder text.
+VISUAL INDICATOR: If a specific instruction is provided, add a clearly visible "pointing finger" emoji or graphic (👉) pointing EXACTLY at the UI element or data point mentioned in the instruction. The finger should be placed so it doesn't obscure the text but clearly directs the user's eye to the relevant area.
+
+DO NOT use placeholder text or "lorem ipsum".
 DO NOT generalize numbers or IP addresses.
-DO NOT add artistic lighting or textures.
-Final Quality Check: The final image must be a high-resolution scan of the attached image.
-"""
+DO NOT add artistic lighting, reflections, or textures.
+DO NOT simplify the diagram; if there are 8 rows in the source, there must be exactly 8 rows in the output.
+
+Final Quality Check: The final image must be a high-resolution scan of the attached image Every number, dot, icon and line must match the provided specification."""
 
 ROUTER_SYSTEM_INSTRUCTION = """
 You are an intelligent dispatcher for a technical support system.
@@ -235,176 +240,105 @@ def render_tutorial(data):
 
 # --- 5. MAIN APP LOOP ---
 
+from app.search_manager import GraphSearcher
+
+# --- 5. MAIN APP LOOP ---
+
 def main():
     # Session Initialization
     if "session_id" not in st.session_state:
         st.session_state.session_id = str(uuid.uuid4())
     if "messages" not in st.session_state:
         st.session_state.messages = []
-    if "pdf_context" not in st.session_state:
-        st.session_state.pdf_context = None
+    if "machine_id" not in st.session_state:
+        st.session_state.machine_id = None
 
     render_sidebar()
 
-    st.title("Universal Guide AI 🍌")
+    st.title("Enterprise Manual AI 🚀")
+    st.markdown("Automated Troubleshooting & Technical Support")
 
-    # Context Loader (Upload PDF)
-    if not st.session_state.pdf_context:
-        uploaded_file = st.file_uploader("Upload Manual (PDF)", type=["pdf"])
-        if uploaded_file:
-            st.session_state.pdf_context = uploaded_file.getvalue()
-            st.success("Manual Loaded. Ready for questions.")
-            st.rerun()
-    
+    # Selection of Machine (Manual)
+    try:
+        machines_ref = db.collection("machines").stream()
+        machine_list = [{"id": m.id, "name": m.to_dict().get("name", m.id)} for m in machines_ref]
+        
+        if machine_list:
+            machine_names = [m["name"] for m in machine_list]
+            selected_name = st.selectbox("Select Manual", machine_names)
+            selected_id = next(m["id"] for m in machine_list if m["name"] == selected_name)
+            st.session_state.machine_id = selected_id
+        else:
+            st.warning("No manuals processed yet. Please upload a PDF to the `manualai02a` bucket to start.")
+    except Exception as e:
+        st.error(f"Error fetching manuals: {e}")
+
     # Chat Display
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
-            if isinstance(msg["content"], dict): # It's a tutorial object
-                render_tutorial(msg["content"])
+            if msg["role"] == "assistant" and isinstance(msg.get("data"), dict):
+                render_search_result(msg["data"])
             else:
                 st.write(msg["content"])
 
     # User Input
-    if prompt := st.chat_input("How do I..."):
-        # 1. Append User Msg
+    if prompt := st.chat_input("Ask a troubleshooting question..."):
+        if not st.session_state.machine_id:
+            st.error("Please select a manual first.")
+            st.stop()
+            
         st.session_state.messages.append({"role": "user", "content": prompt})
-        # Save to History DB
-        db.collection("chats").document(st.session_state.session_id).set({
-            "timestamp": datetime.now(),
-            "messages": st.session_state.messages
-        })
-        st.rerun()
-
-    # AI Processing Logic (Triggered on Rerun)
-    if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
-        last_msg = st.session_state.messages[-1]["content"]
         
         with st.chat_message("assistant"):
-            with st.status("Thinking...", expanded=True) as status:
-                
-                # A. ROUTER PHASE
-                status.write("Analyzing request...")
-                
-                # Fetch existing slugs to encourage cache hits
-                existing_slugs = []
+            with st.status("Searching Knowledge Graph...", expanded=True) as status:
+                searcher = GraphSearcher()
                 try:
-                    # Get all document IDs from the tutorials collection
-                    docs = db.collection("tutorials").stream()
-                    existing_slugs = [doc.id for doc in docs]
-                    status.write(f"Checking against {len(existing_slugs)} existing guides...")
-                except Exception as e:
-                    # CRITICAL: Do not silent fail. Report this.
-                    st.error(f"Failed to fetch existing topics: {e}")
-                    status.write("⚠️ DB Read Failed - Cache disabled.")
-
-                router_model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=ROUTER_SYSTEM_INSTRUCTION)
-                
-                # Context-Aware Prompting (Strict Mode)
-                router_prompt = f"""
-                ROLE: Library Archivist.
-                GOAL: Match the user's query to an existing TOPIC in the DATABASE.
-
-                DATABASE OF EXISTING TOPICS:
-                {json.dumps(existing_slugs)}
-
-                USER QUERY: "{last_msg}"
-
-                INSTRUCTIONS:
-                1. SEARCH the DATABASE for a topic that matches the user's intent.
-                2. DECISION:
-                   - IF a match is found: RETURN the EXACT topic_slug from the database.
-                   - IF NO match is found: Generate a NEW, concise, snake_case slug.
-
-                Rules:
-                - Do NOT generate a new slug if a semantically similar one exists.
-                - Output JSON ONLY.
-                """
-                
-                # Deterministic Output
-                router_res = router_model.generate_content(
-                    router_prompt,
-                    generation_config=genai.types.GenerationConfig(temperature=0.0)
-                )
-                
-                try:
-                    # Clean JSON
-                    clean_json = router_res.text.replace("```json", "").replace("```", "").strip()
-                    router_data = json.loads(clean_json)
+                    result = searcher.find_solution_node(st.session_state.machine_id, prompt)
                     
-                    if router_data.get("needs_clarification"):
-                         # Ask for details
-                        resp = router_data.get("clarification_question", "Can you clarify?")
-                        st.session_state.messages.append({"role": "assistant", "content": resp})
-                        st.rerun()
-                    
-                    slug = router_data["topic_slug"]
-                    status.write(f"Topic Identified: **{slug}**")
-
-                    # B. CACHE CHECK PHASE
-                    existing_tutorial = get_tutorial_from_db(slug)
-                    
-                    if existing_tutorial:
-                        status.write("Found guide in database!")
-                        time.sleep(0.5)
-                        final_response = existing_tutorial
-                    
+                    if result:
+                        status.update(label="Found matching solution!", state="complete")
+                        render_search_result(result)
+                        st.session_state.messages.append({
+                            "role": "assistant", 
+                            "content": f"I found a relevant step: {result['label']}",
+                            "data": result
+                        })
                     else:
-                        # C. GENERATION PHASE (Cache Miss)
-                        status.write("Guide not found. Generating from PDF...")
-                        
-                        if not st.session_state.pdf_context:
-                            st.error("No PDF uploaded! Cannot generate guide.")
-                            st.stop()
-
-                        # Generate Text Structure
-                        gen_model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=GENERATOR_SYSTEM_INSTRUCTION)
-                        # We pass a text prompt here. In production, consider using File API for large PDFs.
-                        prompt_context = f"User Request: {last_msg}. Topic Slug: {slug}. Manual is loaded in context."
-                        
-                        # Note: For this snippet, we assume Gemini can answer based on general knowledge 
-                        # OR you must attach the PDF parts to the prompt history. 
-                        # For Sprint 1 simplicity, we are simulating the text generation.
-                        gen_res = gen_model.generate_content(prompt_context)
-                        tutorial_data = json.loads(gen_res.text.replace("```json", "").replace("```", "").strip())
-                        
-                        # Image Pipeline
-                        status.write("Processing visuals (Nano Banana)...")
-                        processed_steps = []
-                        for step in tutorial_data["steps"]:
-                            if step.get("has_visual"):
-                                raw_img = extract_image_from_pdf(st.session_state.pdf_context, step["pdf_page_reference"])
-                                if raw_img:
-                                    # Nano Banana Logic
-                                    processed_img = mock_nano_banana_api(raw_img, NANO_BANANA_PROMPT)
-                                    # Upload
-                                    fname = f"{slug}_step_{step['step_number']}_{uuid.uuid4().hex[:6]}.png"
-                                    url = upload_image_to_storage(processed_img, fname)
-                                    step["image_url"] = url
-                            processed_steps.append(step)
-                        
-                        tutorial_data["steps"] = processed_steps
-                        
-                        # Save to Cache
-                        save_tutorial_to_db(slug, tutorial_data)
-                        final_response = tutorial_data
-
-                    status.update(label="Complete", state="complete", expanded=False)
-                    
-                    # D. RENDER & SAVE
-                    if isinstance(final_response, dict):
-                        render_tutorial(final_response)
-                    else:
-                        st.write(final_response)
-                        
-                    st.session_state.messages.append({"role": "assistant", "content": final_response})
-                    # Update DB
-                    db.collection("chats").document(st.session_state.session_id).set({
-                        "timestamp": datetime.now(),
-                        "messages": st.session_state.messages
-                    })
-
+                        status.update(label="No direct match found.", state="complete")
+                        st.write("I couldn't find a specific troubleshooting step for that in the manual.")
+                        st.session_state.messages.append({
+                            "role": "assistant", 
+                            "content": "I couldn't find a specific troubleshooting step for that in the manual."
+                        })
                 except Exception as e:
-                    st.error(f"Processing Error: {e}")
+                    st.error(f"Search Error: {e}")
+                    status.update(label="Search failed.", state="error")
+
+        # Save to History
+        try:
+            db.collection("chats").document(st.session_state.session_id).set({
+                "timestamp": datetime.now(),
+                "messages": st.session_state.messages,
+                "machine_id": st.session_state.machine_id
+            })
+        except Exception as e:
+            print(f"Error saving chat: {e}")
+
+def render_search_result(node):
+    """Renders a node from the Knowledge Graph."""
+    st.success(f"### 🎯 Step: {node.get('label')}")
+    st.write(node.get('text'))
+    
+    if node.get('ar_anchor'):
+        st.info(f"**Physical Reference (AR Anchor):** {node['ar_anchor']}")
+    
+    steps = node.get('next_possible_steps', [])
+    if steps:
+        st.markdown("#### ➡️ Next Logical Steps")
+        for step in steps:
+            with st.expander(f"Condition: {step.get('condition', 'Next')}"):
+                st.write(f"Following this leads to: **{step.get('to')}**")
 
 if __name__ == "__main__":
     main()
+

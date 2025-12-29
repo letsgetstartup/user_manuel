@@ -42,6 +42,9 @@ def test_nano_banana_flow():
     ...and so on.
 
     Icons - copy exactly where they appear in the source.
+
+    VISUAL INDICATOR: If a specific instruction is provided, add a clearly visible "pointing finger" emoji or graphic (👉) pointing EXACTLY at the UI element or data point mentioned in the instruction. The finger should be placed so it doesn't obscure the text but clearly directs the user's eye to the relevant area.
+
     DO NOT use placeholder text. DO NOT generalize numbers.
     Final Quality Check: Every number, dot, icon and line must match.
     """
