@@ -12,7 +12,9 @@
         }
     ],
     "hosting": {
-        "public": "public",
+        "public": "webapp/out",
+        "cleanUrls": true,
+        "trailingSlash": true,
         "rewrites": [
             {
                 "source": "/api/**",

@@ -7,3 +7,4 @@ firebase-functions
 requests
 pymupdf
 Pillow
+flask-cors

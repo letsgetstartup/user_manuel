@@ -20,3 +20,5 @@ test_search_trace.py
 verify_firestore.py
 verify_restored_chat.py
 tutorial_res.json
+response_*.json
+.firebase/
