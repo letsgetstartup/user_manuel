@@ -195,6 +195,15 @@ def analyze():
             content = msg.get("content", "") or (msg.get("parts", [{}])[0].get("text", "") if msg.get("parts") else "")
             conversation_context += f"{role.upper()}: {content}\n"
         
+        # Find the correct PDF filename for this machine
+        current_pdf = None
+        if machine_id:
+            all_pdfs = [f for f in os.listdir(MANUALS_DIR) if f.lower().endswith('.pdf')]
+            for f in all_pdfs:
+                if machine_id in f.replace(".pdf", "").replace(" ", "_").lower():
+                    current_pdf = f
+                    break
+        
         # --- PHASE 2: GENERATE STRUCTURED TUTORIAL ---
         prompt = f"""
         Based on the CONVERSATION HISTORY below and the manual, create a detailed step-by-step tutorial TO SOLVE THE USER'S SPECIFIC ISSUE.
@@ -210,6 +219,7 @@ def analyze():
         - ONLY set "has_visual": true if the step refers to a specific UI element, dial, button, or structural component shown in a DIAGRAM, ILLUSTRATION, or PICTURE.
         - If the page is primarily blocks of text, set "has_visual": false. We want diagrams, not text screenshots.
         - You MUST provide the exact "pdf_page_reference" (e.g. 7, 12, 24).
+        - IMPORTANT: Use the filename "{current_pdf or 'manual.pdf'}" for the "pdf_filename" field.
         - IMPORTANT: In the "instruction" text, always include a specific page reference in brackets at the end, e.g., "Rotate the Steam Dial clockwise [Page 10]".
         
         MANUAL CONTENT:
@@ -223,7 +233,7 @@ def analyze():
               "step_number": 1,
               "instruction": "Short instruction [Page X]",
               "has_visual": true,
-              "pdf_filename": "name.pdf",
+              "pdf_filename": "{current_pdf or 'manual.pdf'}",
               "pdf_page_reference": 10
             }}
           ]
@@ -239,233 +249,151 @@ def analyze():
                     temperature=0.1
                 )
             )
-            try:
-                raw_data = json.loads(response.text)
-                print(f"DEBUG: Gemini raw response: {response.text}")
-                
-                # Robust extraction of 'steps'
-                tutorial_data = {}
-                flat_steps = []
-
-                def find_steps_recursive(data):
-                    if isinstance(data, list):
-                        # If it's a list of objects with instructions, we've found it
-                        if data and isinstance(data[0], dict) and "instruction" in data[0]:
-                            return data
-                        for item in data:
-                            res = find_steps_recursive(item)
-                            if res: return res
-                    elif isinstance(data, dict):
-                        if "steps" in data and isinstance(data["steps"], list) and data["steps"]:
-                            # Check if the nested steps have instructions
-                            if "instruction" in data["steps"][0]:
-                                return data["steps"]
-                            else:
-                                # Keep digging
-                                return find_steps_recursive(data["steps"])
-                        for v in data.values():
-                            res = find_steps_recursive(v)
-                            if res: return res
-                    return None
-
-                flat_steps = find_steps_recursive(raw_data)
-                
-                if not flat_steps:
-                    # Fallback: if Gemini returned a list directly but no instruction key
-                    if isinstance(raw_data, list):
-                        flat_steps = raw_data
-                    elif isinstance(raw_data, dict) and "steps" in raw_data:
-                        flat_steps = raw_data["steps"]
-
-                # Final sanitization: ensure each step has a number and is a dict
-                sanitized_steps = []
-                for i, s in enumerate(flat_steps or []):
-                    if isinstance(s, dict):
-                        s.setdefault("step_number", i + 1)
-                        if "instruction" in s:
-                            sanitized_steps.append(s)
-                    elif isinstance(s, str):
-                        sanitized_steps.append({
-                            "step_number": i + 1,
-                            "instruction": s,
-                            "has_visual": False
-                        })
-                
-                tutorial_data["steps"] = sanitized_steps
-                tutorial_data.setdefault("title", "Tutorial")
-                tutorial_data.setdefault("intro", "")
-                
-            except Exception as e:
-                print(f"ERROR: JSON loads/parsing failed: {e}")
-                return jsonify({'error': f"JSON Parse Error: {str(e)}"}), 500
-
-            steps = tutorial_data.get("steps", [])
-            print(f"DEBUG: Final sanitized tutorial contains {len(steps)} steps")
+            raw_data = json.loads(response.text)
             
-            # Extract images for steps that have visuals (limit to 10 to avoid timeout)
+            # Robust extraction of 'steps'
+            tutorial_data = {}
+            flat_steps = []
+
+            def find_steps_recursive(data):
+                if isinstance(data, list):
+                    if data and isinstance(data[0], dict) and "instruction" in data[0]:
+                        return data
+                    for item in data:
+                        res = find_steps_recursive(item)
+                        if res: return res
+                elif isinstance(data, dict):
+                    if "steps" in data and isinstance(data["steps"], list) and data["steps"]:
+                        if "instruction" in data["steps"][0]:
+                            return data["steps"]
+                        else:
+                            return find_steps_recursive(data["steps"])
+                    for v in data.values():
+                        res = find_steps_recursive(v)
+                        if res: return res
+                return None
+
+            flat_steps = find_steps_recursive(raw_data)
+            
+            if not flat_steps:
+                if isinstance(raw_data, list):
+                    flat_steps = raw_data
+                elif isinstance(raw_data, dict) and "steps" in raw_data:
+                    flat_steps = raw_data["steps"]
+
+            sanitized_steps = []
+            for i, s in enumerate(flat_steps or []):
+                if isinstance(s, dict):
+                    s.setdefault("step_number", i + 1)
+                    if "instruction" in s:
+                        sanitized_steps.append(s)
+                elif isinstance(s, str):
+                    sanitized_steps.append({
+                        "step_number": i + 1,
+                        "instruction": s,
+                        "has_visual": False
+                    })
+            
+            tutorial_data["steps"] = sanitized_steps
+            tutorial_data.setdefault("title", "Tutorial")
+            tutorial_data.setdefault("intro", "")
+
+            # Process visuals for steps
             visual_count = 0
-            for step in steps:
+            for step in tutorial_data["steps"]:
+                # Fallback: if filename is missing but has_visual is true, use current_pdf
+                if step.get("has_visual") and not step.get("pdf_filename"):
+                    step["pdf_filename"] = current_pdf
+                
                 if step.get("has_visual") and step.get("pdf_filename") and step.get("pdf_page_reference"):
-                    if visual_count >= 10:
-                        # Fallback for steps beyond the limit: show manual reference only
-                        print(f"DEBUG: Visual limit (10) reached for step {step['step_number']}")
-                        continue
-                        
-                    print(f"DEBUG: Processing visual for step {step['step_number']} (Page {step['pdf_page_reference']})")
+                    if visual_count >= 10: break
                     visual_count += 1
-                    
-                    # Extract original page
                     url = extract_page_image(step["pdf_filename"], step["pdf_page_reference"], machine_id=machine_id)
-                    
                     if not url:
-                        print(f"DEBUG: No image extracted for step {step['step_number']}, disabling visual.")
+                        print(f"DEBUG: Extraction failed for step {step.get('step_number')}")
                         step["has_visual"] = False
                         continue
-
-                    print(f"DEBUG: Extracted image URL: {url}")
-                    # Apply Nano Banana (Visual detection and cropping)
+                    
                     try:
-                        # Fetch original image bytes
                         img_response = requests.get(url, timeout=10)
                         if img_response.status_code == 200:
                             original_img_bytes = img_response.content
-                                
-                            # 1. Detect coordinates using Gemini Vision
-                            print(f"DEBUG: Isolating diagram for: {step['instruction']}")
-                            vision_prompt = f"""
-                            Analyze this technical manual page and identify the SPECIFIC DIAGRAM, ILLUSTRATION, or CLARIFYING IMAGE related to this instruction: '{step['instruction']}'.
-                            
-                            RULES:
-                            1. If the page is just a wall of text with no clear diagram for this specific instruction, return {{"skip": true, "reason": "text_heavy"}}.
-                            2. If there IS a diagram (a drawing of the machine, a button, a cross-section), identify the bounding box of the WHOLE diagram area.
-                            3. Return a JSON object: 
-                               - If found: {{"box_2d": [ymin, xmin, ymax, xmax], "label": "component_name", "visual_utility_score": 0.0-1.0}}
-                               - The visual_utility_score should be LOW (0.1-0.4) if the area is mostly text, and HIGH (0.7-1.0) if it is a clear graphic.
-                               - If visual_utility_score < 0.5, we will discard this image.
-                            Coordinates: 0-1000. JSON ONLY.
-                            """
-                            
+                            vision_prompt = f"Analyze this manual page and find the diagram for: '{step['instruction']}'. Return JSON: {{\"box_2d\": [ymin, xmin, ymax, xmax], \"visual_utility_score\": 0.0-1.0}}."
                             vision_response = client.models.generate_content(
                                 model="gemini-2.0-flash",
-                                contents=[
-                                    types.Part.from_bytes(data=original_img_bytes, mime_type="image/png"),
-                                    vision_prompt
-                                ],
-                                config=types.GenerateContentConfig(
-                                    response_mime_type="application/json",
-                                    temperature=0
-                                )
+                                contents=[types.Part.from_bytes(data=original_img_bytes, mime_type="image/png"), vision_prompt],
+                                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
                             )
-                            
-                            raw_coords = json.loads(vision_response.text)
-                            print(f"DEBUG: Detected raw coordinates: {raw_coords}")
-                            
-                            # Visual Utility Gate
-                            if raw_coords.get("skip") or raw_coords.get("visual_utility_score", 1.0) < 0.5:
-                                print(f"DEBUG: Skipping visual for step {step['step_number']} due to low utility: {raw_coords}")
-                                step["has_visual"] = False
-                                step.pop("image_url", None)
-                                continue
-
-                            # Handle multiple formats: [{...}], {...}, or [...]
-                            if isinstance(raw_coords, list) and len(raw_coords) > 0 and isinstance(raw_coords[0], dict):
-                                coords = raw_coords[0]
+                            coords = json.loads(vision_response.text)
+                            print(f"DEBUG: Vision response for visual extraction: {coords}")
+                            if coords.get("visual_utility_score", 1.0) >= 0.5:
+                                box = coords.get('box_2d') or [0, 0, 1000, 1000]
+                                img = Image.open(io.BytesIO(original_img_bytes))
+                                w, h = img.size
+                                left, top, right, bottom = box[1]*w/1000, box[0]*h/1000, box[3]*w/1000, box[2]*h/1000
+                                # Add padding and crop
+                                pad_w, pad_h = (right-left)*0.2, (bottom-top)*0.2
+                                cropped_img = img.crop((max(0, left-pad_w), max(0, top-pad_h), min(w, right+pad_w), min(h, bottom+pad_h)))
+                                
+                                # Add enhanced Nano Banana yellow indicator
+                                draw = ImageDraw.Draw(cropped_img)
+                                target_x, target_y = ((box[1]+box[3])/2*w/1000) - max(0, left-pad_w), ((box[0]+box[2])/2*h/1000) - max(0, top-pad_h)
+                                
+                                # Draw a thick yellow ring
+                                r1, r2 = 20, 25
+                                draw.ellipse([target_x-r2, target_y-r2, target_x+r2, target_y+r2], fill="yellow", outline="black")
+                                draw.ellipse([target_x-r1, target_y-r1, target_x+r1, target_y+r1], fill=None, outline="black")
+                                
+                                # Add the pointing finger emoji
+                                try:
+                                    draw.text((target_x + 30, target_y - 15), "👉", fill="yellow", stroke_width=2, stroke_fill="black")
+                                except:
+                                    # Fallback if emoji rendering fails
+                                    draw.polygon([target_x+30, target_y, target_x+50, target_y-10, target_x+50, target_y+10], fill="yellow", outline="black")
+                                
+                                buf = io.BytesIO()
+                                cropped_img.save(buf, format='PNG')
+                                bucket_name = f"{PROJECT_ID}.firebasestorage.app"
+                                bucket = storage_client.bucket(bucket_name)
+                                nano_path = f"nano_banana/{uuid.uuid4().hex[:8]}.png"
+                                blob = bucket.blob(nano_path)
+                                blob.upload_from_string(buf.getvalue(), content_type='image/png')
+                                blob.make_public()
+                                step["image_url"] = blob.public_url
                             else:
-                                coords = raw_coords
-
-                            if isinstance(coords, dict):
-                                box = coords.get('box_2d') or coords.get('coordinates') or [coords.get('ymin', 0), coords.get('xmin', 0), coords.get('ymax', 1000), coords.get('xmax', 1000)]
-                            else:
-                                box = coords if isinstance(coords, list) and len(coords) == 4 else [0, 0, 1000, 1000]
-
-                            # 2. Process with Pillow
-                            img = Image.open(io.BytesIO(original_img_bytes))
-                            w, h = img.size
-                            
-                            # Convert normalized to pixel
-                            ymin, xmin, ymax, xmax = box
-                            left = xmin * w / 1000
-                            top = ymin * h / 1000
-                            right = xmax * w / 1000
-                            bottom = ymax * h / 1000
-                            
-                            # Add 20% padding
-                            pad_w = (right - left) * 0.2
-                            pad_h = (bottom - top) * 0.2
-                            left = max(0, left - pad_w)
-                            top = max(0, top - pad_h)
-                            right = min(w, right + pad_w)
-                            bottom = min(h, bottom + pad_h)
-                            
-                            # Crop
-                            cropped_img = img.crop((left, top, right, bottom))
-                            cw, ch = cropped_img.size
-                            
-                            # 3. Add Pointing Finger (👉)
-                            # We'll just paste a text emoji if font is available, or draw a simple arrow
-                            draw = ImageDraw.Draw(cropped_img)
-                            # Attempt to draw a bright yellow circle/arrow at the target (center of detected box relative to crop)
-                            target_x = ( ( (xmin + xmax)/2 * w / 1000 ) - left )
-                            target_y = ( ( (ymin + ymax)/2 * h / 1000 ) - top )
-                            
-                            # Drawing a "Nano Banana" yellow indicator
-                            r = 15
-                            draw.ellipse([target_x-r, target_y-r, target_x+r, target_y+r], outline="yellow", width=5)
-                            draw.text((target_x + 20, target_y), "👉", fill="yellow")
-
-                            # 4. Upload processed image
-                            processed_byte_arr = io.BytesIO()
-                            cropped_img.save(processed_byte_arr, format='PNG')
-                            processed_bytes = processed_byte_arr.getvalue()
-                            
-                            bucket_name = f"{PROJECT_ID}.firebasestorage.app"
-                            bucket = storage_client.bucket(bucket_name)
-                            nano_path = f"nano_banana/{uuid.uuid4().hex[:8]}.png"
-                            nano_blob = bucket.blob(nano_path)
-                            nano_blob.upload_from_string(processed_bytes, content_type='image/png')
-                            nano_blob.make_public()
-                            
-                            step["image_url"] = nano_blob.public_url
-                            print(f"DEBUG: Nano Banana success! URL: {step['image_url']}")
-
-                    except Exception as ne:
-                        print(f"ERROR: Nano Banana processing failed: {ne}")
-                        step["image_url"] = url # Fallback to full page if vision/crop fails
+                                step["image_url"] = url
+                    except Exception:
+                        step["image_url"] = url
             
             return jsonify({'tutorial': tutorial_data})
         except Exception as e:
-            print(f"ERROR: Tutorial Gen Failed: {e}")
-            return jsonify({'error': f"Tutorial Gen Error: {str(e)}"}), 500
+            return jsonify({'error': str(e)}), 500
     else:
-        print("DEBUG: Status: Summary Response Phase")
-        # --- PHASE 1: SUMMARY RESPONSE + CONFIRMATION ---
+        # --- PHASE 1: SUMMARY RESPONSE ---
+        graph_context = ""
+        if machine_id:
+            try:
+                searcher = GraphSearcher()
+                graph_node = searcher.find_solution_node(machine_id, user_message)
+                if graph_node:
+                    graph_context = f"GRAPH MATCH: {graph_node.get('label')} - {graph_node.get('text')}"
+            except Exception as e:
+                print(f"Graph Search Error: {e}")
+
         prompt = f"""
-        You are a Technical Support assistant. 
-        Analyze the user's request (text and/or image) using the Manual Content provided.
-        - Be EXTREMELY precise. If troubleshooting, mention specific steps or parts (e.g., "check for a blocked filter basket").
-        - Cite specific page numbers from the manual for every piece of advice (e.g., "[Page 29]").
-        - Use the provided context to offer the most accurate solution.
-        - End by asking if they want a step-by-step tutorial with diagrams.
+        Analyze the user's request using the Manual Content AND Graph info.
+        1. Provide a clear point-based answer.
+        2. Cite page numbers like [Page X].
+        3. END by asking if they want a step-by-step tutorial with diagrams.
         
-        MANUAL CONTENT:
-        {relevant_context[:500000]}
+        GRAPH INFO: {graph_context}
+        MANUAL: {relevant_context[:500000]}
         """
-        
-        contents = [prompt]
-        if user_message:
-            contents.append(user_message)
-        if image_part:
-            contents.append(image_part)
-            
         try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=contents,
-                config=types.GenerateContentConfig(temperature=0.4)
-            )
+            response = client.models.generate_content(model=MODEL_NAME, contents=[prompt, user_message] + ([image_part] if image_part else []))
             return jsonify({'solution': response.text})
         except Exception as e:
-            return jsonify({'error': f"Analysis Error: {str(e)}"}), 500
+            return jsonify({'error': str(e)}), 500
 
 from google.cloud.firestore_v1.vector import Vector
 from google.cloud.firestore_v1.base_vector_query import DistanceMeasure

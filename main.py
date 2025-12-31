@@ -30,6 +30,8 @@ import fitz  # PyMuPDF
 import json
 import time
 import uuid
+import requests
+import os
 from datetime import datetime
 
 # --- 1. CONFIGURATION & SINGLETON SETUP ---
@@ -276,43 +278,68 @@ def main():
     # Chat Display
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
-            if msg["role"] == "assistant" and isinstance(msg.get("data"), dict):
-                render_search_result(msg["data"])
+            if msg["role"] == "assistant":
+                if "tutorial" in msg:
+                    render_tutorial(msg["tutorial"])
+                elif "data" in msg:
+                    render_search_result(msg["data"])
+                else:
+                    st.write(msg["content"])
             else:
                 st.write(msg["content"])
 
     # User Input
-    if prompt := st.chat_input("Ask a troubleshooting question..."):
-        if not st.session_state.machine_id:
-            st.error("Please select a manual first.")
-            st.stop()
-            
         st.session_state.messages.append({"role": "user", "content": prompt})
         
         with st.chat_message("assistant"):
-            with st.status("Searching Knowledge Graph...", expanded=True) as status:
-                searcher = GraphSearcher()
+            with st.status("Thinking...", expanded=True) as status:
                 try:
-                    result = searcher.find_solution_node(st.session_state.machine_id, prompt)
+                    # Prepare history for backend
+                    history = []
+                    for m in st.session_state.messages[:-1]: # Exclude current prompt
+                        history.append({"role": m["role"], "content": m["content"]})
                     
-                    if result:
-                        status.update(label="Found matching solution!", state="complete")
-                        render_search_result(result)
-                        st.session_state.messages.append({
-                            "role": "assistant", 
-                            "content": f"I found a relevant step: {result['label']}",
-                            "data": result
-                        })
+                    # Call Unified Backend API
+                    # The backend URL is usually the same host during local dev or a specific Firebase Function URL
+                    # For local testing, we might need a dynamic URL or a fixed one.
+                    # Assuming local development for now, or using a proxy if needed.
+                    backend_url = "http://localhost:5001/manualai-481406/us-central1/api/api/analyze" 
+                    # Note: The double 'api' in path is common with firebase_functions + flask
+                    
+                    # Fallback for local testing if not running firebase emulators
+                    if os.environ.get("USE_LOCAL_FLASK"):
+                        backend_url = "http://localhost:5000/api/analyze"
+
+                    payload = {
+                        'message': prompt,
+                        'machine_id': st.session_state.machine_id,
+                        'history': json.dumps(history)
+                    }
+                    
+                    response = requests.post(backend_url, data=payload)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        status.update(label="Response received!", state="complete")
+                        
+                        if 'solution' in data:
+                            st.markdown(data['solution'])
+                            st.session_state.messages.append({"role": "assistant", "content": data['solution']})
+                        elif 'tutorial' in data:
+                            render_tutorial(data['tutorial'])
+                            st.session_state.messages.append({
+                                "role": "assistant", 
+                                "content": "Here is your step-by-step tutorial.",
+                                "tutorial": data['tutorial']
+                            })
+                        else:
+                            st.error("Unexpected response format from backend.")
                     else:
-                        status.update(label="No direct match found.", state="complete")
-                        st.write("I couldn't find a specific troubleshooting step for that in the manual.")
-                        st.session_state.messages.append({
-                            "role": "assistant", 
-                            "content": "I couldn't find a specific troubleshooting step for that in the manual."
-                        })
+                        st.error(f"Backend Error: {response.text}")
+                        status.update(label="Request failed.", state="error")
                 except Exception as e:
-                    st.error(f"Search Error: {e}")
-                    status.update(label="Search failed.", state="error")
+                    st.error(f"Communication Error: {e}")
+                    status.update(label="Error.", state="error")
 
         # Save to History
         try:
