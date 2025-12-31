@@ -45,7 +45,8 @@ def extract_text_from_pdf(pdf_path):
     try:
         reader = PdfReader(pdf_path)
         text = ""
-        for page in reader.pages:
+        for i, page in enumerate(reader.pages):
+            text += f"--- [PAGE_INDEX: {i}] ---\n"
             text += page.extract_text() + "\n"
         return text
     except Exception as e:
@@ -118,7 +119,7 @@ def extract_page_image(pdf_filename, page_num, machine_id=None):
             return None
             
         doc = fitz.open(pdf_path)
-        page_index = int(page_num) - 1
+        page_index = int(page_num)
         if 0 <= page_index < len(doc):
             page = doc.load_page(page_index)
             pix = page.get_pixmap(dpi=150)
@@ -216,11 +217,11 @@ def analyze():
         Address the specific potential causes mentions in the assistant's previous analysis.
         
         VISUAL RULES:
-        - ONLY set "has_visual": true if the step refers to a specific UI element, dial, button, or structural component shown in a DIAGRAM, ILLUSTRATION, or PICTURE.
-        - If the page is primarily blocks of text, set "has_visual": false. We want diagrams, not text screenshots.
-        - You MUST provide the exact "pdf_page_reference" (e.g. 7, 12, 24).
+        - SET "has_visual": true if the step refers to a physical component, action, or setting that has a corresponding DIAGRAM or illustration on that page (even if there is also text).
+        - ONLY set "has_visual": false if the page is literally ONLY blocks of text with no icons or diagrams.
+        - You MUST provide the exact "pdf_page_reference" using the technical `PAGE_INDEX` found in the context markers (e.g. if the info is near `--- [PAGE_INDEX: 9] ---`, the reference is 9).
         - IMPORTANT: Use the filename "{current_pdf or 'manual.pdf'}" for the "pdf_filename" field.
-        - IMPORTANT: In the "instruction" text, always include a specific page reference in brackets at the end, e.g., "Rotate the Steam Dial clockwise [Page 10]".
+        - IMPORTANT: In the "instruction" text, include the PAGE_INDEX in brackets at the end, e.g., "Rotate the Steam Dial clockwise [PAGE_INDEX: 10]".
         
         MANUAL CONTENT:
         {relevant_context[:500000]}
@@ -231,7 +232,7 @@ def analyze():
           "steps": [
             {{
               "step_number": 1,
-              "instruction": "Short instruction [Page X]",
+              "instruction": "Short instruction [PAGE_INDEX: X]",
               "has_visual": true,
               "pdf_filename": "{current_pdf or 'manual.pdf'}",
               "pdf_page_reference": 10
@@ -325,8 +326,12 @@ def analyze():
                                 config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
                             )
                             coords = json.loads(vision_response.text)
+                            # Handle Gemini returning a list of detections
+                            if isinstance(coords, list) and len(coords) > 0:
+                                coords = coords[0]
+                            
                             print(f"DEBUG: Vision response for visual extraction: {coords}")
-                            if coords.get("visual_utility_score", 1.0) >= 0.5:
+                            if isinstance(coords, dict) and coords.get("visual_utility_score", 1.0) >= 0.5:
                                 box = coords.get('box_2d') or [0, 0, 1000, 1000]
                                 img = Image.open(io.BytesIO(original_img_bytes))
                                 w, h = img.size
@@ -383,7 +388,7 @@ def analyze():
         prompt = f"""
         Analyze the user's request using the Manual Content AND Graph info.
         1. Provide a clear point-based answer.
-        2. Cite page numbers like [Page X].
+        2. Cite page references using the technical marker format found in the text, e.g., [PAGE_INDEX: 9].
         3. END by asking if they want a step-by-step tutorial with diagrams.
         
         GRAPH INFO: {graph_context}
